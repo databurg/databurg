@@ -1,5 +1,7 @@
 # Databurg Backup System
 
+![Build And Release](https://github.com/databurg/databurg/actions/workflows/release.yml/badge.svg)
+
 Databurg is an open-source backup system designed for efficient local and remote data management. It balances ease of use with robust data security and integrity, making it suitable for both small projects and large-scale deployments. Databurg provides flexible and reliable file backup options, advanced data recovery features, and tools for monitoring storage status, serving as a simpler alternative to traditional systems like  S3.
 
 ## Key Features
