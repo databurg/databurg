@@ -1,0 +1,23 @@
+[package]
+name = "main"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/databurg/databurg"
+license = "Apache-2.0"
+
+[dependencies]
+byteorder = "1.5.0"
+log = "0.4.22"
+serde = {version = "1.0.215", features = ["derive"]}
+serde_json = "1.0.133"
+tokio = {version = "1.41.1", features = ["full", "tracing"]}
+tokio-rustls = "0.26.0"
+walkdir = "2.5.0"
+rustls = { version = "0.23.18" }
+flate2 = "1.0.35"
+
+[lib]
+path = "foundation/src/lib.rs"
+
+[workspace]
+members = ["client", "server"]
