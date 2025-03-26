@@ -127,13 +127,13 @@ databurg status -b MyBucket | jq -r '.Ok.meta[] | select(.ack_count > 0) | [.buc
 To restore all files from a bucket to a specific directory:
 
 ```sh
-databurg recover -b MyBucket -s ./ -d ./test-recover
+databurg recover -b MyBucket -s ./ -d ./test-recover [-c /etc/databurg.cnf]
 ```
 
 To recover data from a specific point in time, specify the timestamp:
 
 ```sh
-databurg recover -b MyBucket -s ./ -d ./test-recover -t 1730925459
+databurg recover -b MyBucket -s ./ -d ./test-recover -t 1730925459 [-c /etc/databurg.cnf]
 ```
 
 ## Configuration Guidelines
@@ -153,7 +153,9 @@ Databurg is configured using environment variables set in a `.env` file located 
 To use a custom configuration file:
 
 ```sh
-databurg -c /etc/databurg.cnf
+databurg backup -c /etc/databurg.cnf ..
+databurg recover -c /etc/databurg.cnf ..
+databurg status -c /etc/databurg.cnf ..
 ```
 
 This allows different settings for various environments, including `PRE_SHARED_SECURITY_TOKEN`.
