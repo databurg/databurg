@@ -1,10 +1,10 @@
+#[allow(unused_imports)]
 use crate::{
     env, truncate_to_seconds, Action, Actor, AuthenticationData, CommandData, FileActionData,
     FileInfo, HandshakeData, InnerJob, Job, ObjectMetadata, PreflightRequestData, Status,
 };
 use crate::{BucketStatus, FileSelector, SyncMetadata};
 use flate2::read::GzDecoder;
-#[allow(unused_imports)]
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
