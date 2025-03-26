@@ -7,6 +7,7 @@ use flate2::read::GzDecoder;
 #[allow(unused_imports)]
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::prelude::*;
@@ -375,18 +376,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
             .map(|p| p.checked_add(Duration::from_secs(1)).unwrap());
 
         let prefix = query_bucket.as_str();
-        let mut path = std::path::PathBuf::new();
+        let mut path = std::path::PathBuf::from(self.storage_dir.clone());
         path.push(prefix);
-        if query_path != "." {
+
+        if query_path != "." && query_path != "/" {
             path.push(query_path);
         }
 
         let mut files_vec: Vec<FileInfo> = vec![];
 
+        // Additional security
+        let ls = format!("{}", self.storage_dir.clone());
+        if !path.starts_with(ls.clone()) {
+            error!("Path does not start with {}.. {:?}", ls, path.to_str());
+            return files_vec;
+        }
+
         // If |path|.latest exists, client wants to recover a single file
         let mut path_latest = path.clone();
         path_latest.push("latest");
-        debug!("Path latest: {:?}", path_latest);
         if path_latest.is_symlink() {
             // Requested data is a specific file in the backup
             if let Ok(f) = self
@@ -457,8 +465,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 bucket: query_bucket,
                 meta,
             };
-
-            debug!("File: {:?}", file_info);
 
             // Return the FileInfo object if it has an internal path
             if file_info.path_internal.is_some() {
@@ -644,6 +650,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         let mut await_bytes = 0;
         let mut fd: Option<File> = None;
         let mut fd_pos: usize = 0;
+
         loop {
             match current_stage {
                 Stage::Handshake => {
@@ -654,7 +661,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 }
 
                 Stage::Authentication => {
-                    if self.handle_authentication().await.is_err() {
+                    let auth_res = self.handle_authentication().await;
+                    if auth_res.is_err() {
                         return;
                     }
                     current_stage = Stage::Command;
@@ -663,13 +671,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 Stage::Command => {
                     if let Ok(cmd) = self.actor.get_command().await {
                         self.reset_fd(&mut fd).await;
-                        current_stage = self.handle_command(cmd, &mut current_command_data).await;
+
+                        if let Some(st) = self.handle_command(cmd, &mut current_command_data).await
+                        {
+                            current_stage = st;
+                        } else {
+                            // Authentication failed due to bucket
+                            // mismatch or bucket authentication issues.
+                            return;
+                        }
                     } else {
                         return;
                     }
                 }
 
                 Stage::ServerPreflightRequest => {
+                    // KEIN BUCKET NAME IM current_command_data
+
                     if self
                         .handle_preflight(&mut current_command_data)
                         .await
@@ -681,6 +699,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 }
 
                 Stage::ServerSetSyncMetadata => {
+                    // KEIN BUCKET NAME IM current_command_data
                     if self.handle_sync_metadata().await.is_err() {
                         return;
                     }
@@ -688,6 +707,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 }
 
                 Stage::ServerFileSender => {
+                    let bucket = current_command_data.clone().unwrap().query.unwrap().bucket;
+                    if self.handle_bucket_auth(bucket, false).await.is_err() {
+                        // Auth for bucket/auth_token combination failed.
+                        return;
+                    }
                     _ = self
                         .handle_server_file_sender(&mut current_command_data)
                         .await;
@@ -695,6 +719,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 }
 
                 Stage::ServerFileReceiver => {
+                    // KEIN BUCKET NAME IM current_command_data
                     if let Ok(new_stage) = self
                         .handle_server_file_receiver(
                             &mut fd,
@@ -730,8 +755,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 Stage::ServerFileList => {}
 
                 Stage::ServerFileBucketStatus => {
-                    self.handle_server_bucket_status(&mut current_command_data)
-                        .await;
+                    let bucket = current_command_data.clone().unwrap().query.unwrap().bucket;
+                    if self.handle_bucket_auth(bucket, false).await.is_err() {
+                        // Auth for bucket/auth_token combination failed.
+                        debug!("Bucket Auth Failed in handle_bucket_auth() - sending nack");
+                        self.actor.send_nack().await;
+                    } else {
+                        debug!("Bucket Auth OK in handle_bucket_auth()");
+                        self.handle_server_bucket_status(&mut current_command_data)
+                            .await;
+                    }
                     return;
                 }
 
@@ -794,6 +827,64 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         }
     }
 
+    async fn handle_bucket_auth(&mut self, bucket: String, write_op: bool) -> Result<(), ()> {
+        match self.actor.auth_token.clone() {
+            Some(auth_token) => {
+                let mut hasher = Sha256::new();
+                hasher.update(auth_token);
+                let auth_token_hash = format!("{:x}", hasher.finalize());
+
+                // Find bucket's (|bucket|) auth token hash
+
+                // - Build Path
+                let mut bucket_path = std::path::PathBuf::new();
+                bucket_path.push(&self.storage_dir);
+                bucket_path.push(bucket.clone());
+
+                let mut auth_path = PathBuf::from(&self.storage_dir);
+                auth_path.push(format!(".{}.auth", bucket));
+
+                // - Check if Path exists
+                // - If path does not exists, add a .auth file and write the hash (only on write operations, not on list/status/preflight)
+                if bucket_path.exists() {
+                    // - Is there a .auth file?
+                    if !auth_path.exists() {
+                        return Err(()); // We do have a auth_token (no master user) but no .auth-file -> refuse access to bucket
+                    }
+                    // - read content and compare hashes
+                    if let Ok(auth_token_hash_from_bucket) = fs::read_to_string(auth_path) {
+                        if auth_token_hash_from_bucket.trim() == auth_token_hash.trim() {
+                            return Ok(());
+                        }
+                    }
+
+                    // Cannot read auth file or hash does not match
+                    return Err(());
+                } else {
+                    // - path does not exists PLUS
+                    if write_op {
+                        // - this is a write operation
+                        // = create the initial .auth file
+                        // write |auth_token_hash| into the .auth file
+                        if fs::write(auth_path, auth_token_hash.into_bytes()).is_ok() {
+                            return Ok(());
+                        } else {
+                            error!(
+                                "Could not write new auth token hash to .auth-file on bucket {:?}",
+                                bucket
+                            );
+                        }
+                    }
+                }
+
+                Err(())
+            }
+            // No self.actor.auth_token means the client
+            // is authenticated with a master key by (handle_authentication())
+            None => Ok(()),
+        }
+    }
+
     async fn handle_authentication(&mut self) -> Result<(), ()> {
         match self.actor.next_msg().await {
             Some(buf) => {
@@ -811,11 +902,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                     != env::var("PRE_SHARED_SECURITY_TOKEN")
                         .expect("PRE_SHARED_SECURITY_TOKEN not set")
                 {
-                    error!("Authentication failed");
-                    self.actor.send_nack().await;
-                    return Err(());
+                    // Maybe this authentication token is specific to the bucket.
+                    debug!("No matching master token. Limiting access to on bucket-level");
+                    self.actor.auth_token = Some(String::from(ad.token));
+                } else {
+                    debug!("Authentication succeeded - {:?}", ad);
                 }
-                debug!("Authentication succeeded - {:?}", ad);
                 self.actor.send_ack().await;
                 Ok(())
             }
@@ -838,12 +930,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         &mut self,
         cmd: CommandData,
         current_command_data: &mut Option<CommandData>,
-    ) -> Stage {
+    ) -> Option<Stage> {
         *current_command_data = Some(cmd.clone());
         if cmd.action != Action::List {
             self.actor.send_ack().await;
         }
-        match cmd.action {
+        Some(match cmd.action {
             Action::Preflight => Stage::ServerPreflightRequest,
             Action::SetSyncMetadata => Stage::ServerSetSyncMetadata,
             Action::Sync => Stage::ServerFileReceiver,
@@ -853,7 +945,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 self.actor.send_nack().await;
                 Stage::Command
             }
-        }
+        })
     }
 
     async fn handle_preflight(
@@ -882,15 +974,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
 
                         let mut retained_files = vec![];
                         for f in file_list.iter() {
+                            let bucket = query.bucket.clone();
                             let mut path = std::path::PathBuf::new();
                             path.push(&self.storage_dir);
-                            path.push(&query.bucket);
+                            path.push(&bucket);
                             path.push(&f.file_path);
                             let path = path.canonicalize();
-                            if path.is_err() {
+
+                            // Do authentication
+                            if self.handle_bucket_auth(bucket, false).await.is_err()
+                                || path.is_err()
+                            {
                                 retained_files.push(f.clone());
                                 continue;
                             }
+
                             let mut path = path.unwrap();
                             let path_nohash = path.clone();
                             path.push(&f.file_hash);
@@ -1012,8 +1110,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 self.reset_fd(fd).await;
                 let cad = current_action_data.clone().unwrap();
                 let mut path = std::path::PathBuf::new();
+                let bucket = cad.job.bucket.clone().unwrap();
+
                 path.push(&self.storage_dir);
-                path.push(cad.job.bucket.clone().unwrap());
+                path.push(bucket.clone());
+
+                if self.handle_bucket_auth(bucket, true).await.is_err() {
+                    // Auth for bucket/auth_token combination failed.
+                    self.actor.send_nack().await;
+                    return Ok(Stage::Command);
+                }
+
                 path.push(cad.job.file_path.clone().unwrap());
                 path.push(cad.job.file_hash.clone().unwrap());
 
@@ -1161,7 +1268,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
 
         if query.path.starts_with("./") {
             query.path = query.path.replacen("./", "", 1);
+        } else if query.path.starts_with("/") {
+            query.path = query.path.replacen("/", "", 1);
         }
+
         if query.path.contains("..") {
             error!("Request path contains ..; exiting!");
             return Err(());
@@ -1173,6 +1283,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
             // 1. Send FileActionData (like the client currently does)
             //    to Stage::ClientFileReceiver on client side
             let bucket = file.clone().bucket;
+
             let file = file.clone().path_internal.unwrap();
             let file_path = file.display().to_string();
             let file_hash = file.as_path().to_string_lossy().to_string();
@@ -1183,7 +1294,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
             // only til the last / (cut away the file hash)
             let target = target[0..target.rfind('/').unwrap()].to_string();
             // remove local storage dir including the bucket name form the path
-            let local_root = format!("{}/", bucket);
+            let local_root = format!("{}/{}/", self.storage_dir, bucket);
             let mut target = target.replace(&local_root, "");
             // cut away everything from query.path until the last / if there
             // is more than one /

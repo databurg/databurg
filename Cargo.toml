@@ -1,20 +1,20 @@
 [package]
 name = "main"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/databurg/databurg"
 license = "Apache-2.0"
 
 [dependencies]
 byteorder = "1.5.0"
-log = "0.4.22"
-serde = {version = "1.0.215", features = ["derive"]}
-serde_json = "1.0.133"
-tokio = {version = "1.41.1", features = ["full", "tracing"]}
-tokio-rustls = "0.26.0"
+log = "0.4.27"
+serde = {version = "1.0.219", features = ["derive"]}
+serde_json = "1.0.140"
+tokio = {version = "1.44.1", features = ["full", "tracing"]}
+tokio-rustls = "0.26.2"
 walkdir = "2.5.0"
-rustls = { version = "0.23.18" }
-flate2 = "1.0.35"
+rustls = { version = "0.23.25" }
+flate2 = "1.1.0"
 
 [lib]
 path = "foundation/src/lib.rs"

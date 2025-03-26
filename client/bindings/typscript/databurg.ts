@@ -19,6 +19,7 @@ type FileSelector = {
     path: string
     bucket: string
     point_in_time?: SystemTime
+    auth?: string
 }
 
 type CommandData = {

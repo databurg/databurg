@@ -72,7 +72,6 @@ async fn main() -> Result<(), ()> {
         .subcommand(
             Command::new("backup")
                 .about("Copy files to a Databurg server")
-                .arg(conf_arg())
                 .arg(source_arg())
                 .arg(bucket_arg())
                 .arg(tags_arg()),
@@ -80,7 +79,6 @@ async fn main() -> Result<(), ()> {
         .subcommand(
             Command::new("recover")
                 .about("Get files from a Databurg server")
-                .arg(conf_arg())
                 .arg(source_arg())
                 .arg(dest_arg())
                 .arg(bucket_arg())
@@ -89,11 +87,11 @@ async fn main() -> Result<(), ()> {
         .subcommand(
             Command::new("status")
                 .about("Get bucket status")
-                .arg(conf_arg())
                 .arg(source_arg())
                 .arg(bucket_arg())
                 .arg(time_arg()),
-        );
+        )
+        .arg(conf_arg());
 
     // Parse the CLI arguments
     let matches = cmd.get_matches();

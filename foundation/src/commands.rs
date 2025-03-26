@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use log::info;
+use log::{error, info};
 
 use crate::{
     actor, protocol, Action, Actor, BucketStatus, CommandData, FileSelector, PreflightFileInfo,
@@ -38,8 +38,11 @@ pub async fn status(bucket: String, point_in_time: Option<SystemTime>) -> Result
     if let Some(msg) = h.actor.next_msg().await {
         let msg = String::from_utf8_lossy(&msg);
         let msg = msg.trim();
-        let bucket_status: BucketStatus = serde_json::from_str(msg).unwrap();
-        return Ok(bucket_status);
+        if let Ok(bucket_status) = serde_json::from_str(msg) {
+            return Ok(bucket_status);
+        }
+
+        error!("Bucket access denied");
     }
 
     Err(())

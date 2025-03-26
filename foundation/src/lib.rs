@@ -97,6 +97,7 @@ pub struct Actor<S> {
     raw_sender_rx: Receiver<ChannelMessage>,
     handshake_done: bool,
     auth_done: bool,
+    auth_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

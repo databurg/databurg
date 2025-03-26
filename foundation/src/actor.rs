@@ -188,6 +188,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             raw_sender_tx,
             handshake_done: false,
             auth_done: false,
+            auth_token: None,
         }
     }
 
