@@ -501,7 +501,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
             };
 
             if let Some(pit) = point_in_time {
-                if filename != "latest" {
+                if filename != "latest" && !filename.starts_with(".") {
                     let created = match metadata.created() {
                         Ok(time) => time,
                         Err(_) => continue,

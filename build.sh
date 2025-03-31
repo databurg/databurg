@@ -11,5 +11,5 @@ PRE_SHARED_SECURITY_TOKEN=your_secret
 #PRIVATE_KEY_FILE=/path/to/key.pem
 EOF
 fi
-cargo build -p server -r && \
-cargo build -p client -r
+cargo build -p server && \
+cargo build -p client
