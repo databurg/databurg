@@ -22,6 +22,13 @@ use tokio_rustls::{TlsConnector, TlsStream};
 /// Constants used throughout the Actor.
 pub const MESSAGE_LENGTH_BYTES: usize = 4;
 pub const DEFAULT_CHUNK_SIZE: usize = 2_097_152; // 2 MB
+/// Largest accepted single wire frame. Bounds the per-frame allocation so a
+/// peer cannot request a multi-gigabyte buffer; comfortably above the largest
+/// legitimate frame (a compressed data chunk or a full preflight file list).
+pub const MAX_MESSAGE_LENGTH: usize = 512 * 1024 * 1024;
+/// How long a connection may sit idle waiting for the next frame before it is
+/// dropped, reclaiming slow-loris and abandoned connections.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Why [`Actor::send_file`] failed.
 #[derive(Debug)]
@@ -853,11 +860,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
         let mut buf = vec![0; MESSAGE_LENGTH_BYTES];
         // Get a mutable reference to the socket reader
         let s = self.socket_r.as_mut()?;
-        // Attempt to read the length prefix; return `None` on failure
-        s.read_exact(&mut buf).await.ok()?;
+        // Read the length prefix, dropping the connection if it sits idle for
+        // too long (slow-loris / abandoned connection).
+        match tokio::time::timeout(IDLE_TIMEOUT, s.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return None,
+            Err(_) => {
+                debug!("Connection idle timeout while waiting for a frame");
+                return None;
+            }
+        }
         // Decode the message length using BigEndian
-        let msg_len = BigEndian::read_u32(&buf);
-        Some(msg_len as usize)
+        let msg_len = BigEndian::read_u32(&buf) as usize;
+        // Reject implausibly large frames before allocating for them.
+        if msg_len > MAX_MESSAGE_LENGTH {
+            error!("Rejecting oversized frame: {} bytes", msg_len);
+            return None;
+        }
+        Some(msg_len)
     }
 
     /// Retrieves the next incoming message from the server.
