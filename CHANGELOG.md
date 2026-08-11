@@ -2,9 +2,10 @@
 
 All notable changes to this project are documented here.
 
-## 0.3.1
+## 0.3.2
 
 **Upgrade from 0.0.x directly to this release. Do not deploy 0.3.0.**
+Deployed cron runners keep working unchanged; only the binary is replaced.
 
 ### Fixed
 
