@@ -27,6 +27,15 @@ All notable changes to this project are documented here.
   the read path already had. It is reachable after authentication on the
   recover path, where a peer could announce a length and stall to pin a
   connection.
+- **`-c/--config` is accepted on both sides of the subcommand again.** 0.3.0
+  made it top-level only, which turned the form every deployed cron runner uses
+  (`databurg backup -c FILE ...`, inherited from 0.0.1) into a usage error — a
+  binary swap alone would have aborted every nightly run. Deployed scripts now
+  keep working untouched.
+- **An unreachable server no longer panics.** Four call sites unwrapped the
+  connection result, so a server that is down or fails the certificate pin
+  produced a panic per connection and buried the real cause in backtraces. The
+  run now ends with a non-zero exit and a readable message.
 - The TypeScript binding verifies the server certificate against a pin instead
   of accepting any certificate, and no longer swallows connection errors.
 

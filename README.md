@@ -158,11 +158,11 @@ Databurg is configured at runtime from a config file (`/etc/databurg.cnf` by
 default, or `-c <path>`). Nothing is compiled into the binaries, and a missing or
 unreadable config file is a fatal error. See [`databurg.cnf.sample`](./databurg.cnf.sample).
 
-> **`-c` is a top-level option and must precede the subcommand:**
-> `databurg -c /etc/databurg.cnf backup -s … -b …`.
-> Release 0.0.1 accepted `-c` *after* the subcommand and then silently ignored
-> it, always reading `/etc/databurg.cnf`. Scripts written against that release
-> must be adjusted when upgrading, or the client exits with a usage error.
+> `-c` is accepted on either side of the subcommand — both
+> `databurg -c FILE backup …` and `databurg backup -c FILE …` work.
+> Release 0.0.1 accepted only the latter and then silently ignored the value,
+> always reading `/etc/databurg.cnf`; from 0.3.1 on the path is honoured
+> wherever it is given, so scripts written for 0.0.1 keep working unchanged.
 
 - `SERVER_HOSTNAME`: Server IP address or hostname.
 - `SERVER_PORT`: Server listening port (default: 2403).
