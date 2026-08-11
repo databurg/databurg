@@ -96,13 +96,15 @@ async fn main() -> Result<(), ()> {
     // Parse the CLI arguments
     let matches = cmd.get_matches();
 
-    // Handle configuration file loading if specified
-    if let Some(config_file) = matches.get_one::<String>("conf") {
-        // Load the specified config file
-        env::load_config(config_file.to_string());
-    } else {
-        // Use built in config? We prefer to use the config file from the default path
-        env::load_config("/etc/databurg.cnf".to_string());
+    // Load configuration from the config file. There is no embedded fallback,
+    // so a missing or unreadable config is fatal.
+    let config_file = matches
+        .get_one::<String>("conf")
+        .map(|s| s.as_str())
+        .unwrap_or("/etc/databurg.cnf");
+    if let Err(e) = env::load_config(config_file) {
+        eprintln!("Could not read config file {}: {}", config_file, e);
+        exit(1);
     }
 
     // Match and handle the provided subcommand
@@ -142,8 +144,7 @@ async fn main() -> Result<(), ()> {
     Ok(())
 }
 
-/// Initializes environment variables and logging
+/// Initializes logging.
 fn initialize_environment() {
-    env::init();
     env_logger::init();
 }

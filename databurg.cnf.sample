@@ -1,0 +1,26 @@
+# databurg configuration — deploy as /etc/databurg.cnf (or pass with -c).
+# Loaded at runtime by both databurg (client) and databurgd (server).
+# Nothing here is compiled into the binaries; a missing file is fatal.
+
+# --- shared ---
+# Pre-shared authentication token. Keep secret; never commit real values.
+PRE_SHARED_SECURITY_TOKEN=change-me
+
+# --- client (databurg) ---
+# Server to connect to.
+SERVER_HOSTNAME=backup.example.com
+SERVER_PORT=2403
+# SHA-256 of the server's TLS certificate — the pin the client verifies the
+# server against. databurgd logs this value at startup
+# ("Server certificate SHA-256 pin: ..."). The client refuses to connect
+# without it, and rejects any server whose certificate does not match.
+SERVER_CERT_SHA256=
+
+# --- server (databurgd) ---
+SERVER_LISTEN=0.0.0.0
+STORAGE_BASE_DIR=/var/lib/databurg
+# Persistent certificate and key. Required in production so the pin stays
+# stable across restarts; without them databurgd generates an ephemeral
+# self-signed certificate whose pin changes on every start.
+CERTIFICATE_FILE=/etc/databurg/cert.pem
+PRIVATE_KEY_FILE=/etc/databurg/key.pem

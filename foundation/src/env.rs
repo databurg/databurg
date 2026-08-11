@@ -1,15 +1,16 @@
-pub const ENV_FILE: &str = include_str!("../../.env");
+//! Runtime configuration.
+//!
+//! Configuration and secrets (notably `PRE_SHARED_SECURITY_TOKEN`) are loaded
+//! from a config file at runtime only — nothing is baked into the binary. The
+//! caller is expected to treat a missing or unreadable config file as fatal,
+//! so the process never runs with an empty/embedded fallback configuration.
 
-pub fn init() {
-    read(ENV_FILE.to_string());
-}
-
-pub fn load_config(env_file: String) {
-    if let Ok(config) = std::fs::read_to_string(env_file) {
-        read(config);
-    } else {
-        eprintln!("Failed to read .env file. Using embedded config.");
-    }
+/// Loads `env_file` (a `KEY=value` file, `#` comments allowed) into the process
+/// environment. Returns an error if the file cannot be read.
+pub fn load_config(env_file: &str) -> std::io::Result<()> {
+    let config = std::fs::read_to_string(env_file)?;
+    read(config);
+    Ok(())
 }
 
 fn read(config: String) {
@@ -21,7 +22,8 @@ fn read(config: String) {
         let mut parts = line.splitn(2, '=');
         if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
             let value = value.trim();
-            let value = if value.starts_with('"') && value.ends_with('"') {
+            // Strip surrounding double quotes if present.
+            let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
                 &value[1..value.len() - 1]
             } else {
                 value

@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use log::error;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +15,45 @@ pub mod fs;
 pub mod protocol;
 
 type TlsStream<S> = tokio_rustls::TlsStream<S>;
+
+/// SHA-256 of `data` as 32 raw bytes.
+pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// SHA-256 of `data` as lowercase hex — the form used for the server
+/// certificate pin (`SERVER_CERT_SHA256`).
+pub fn sha256_hex(data: &[u8]) -> String {
+    hex_encode(&sha256_bytes(data))
+}
+
+/// Lowercase hex encoding of `bytes`.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Parses exactly 64 hex characters into 32 bytes; `None` on any other length
+/// or a non-hex character.
+pub fn hex_decode32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (bytes[2 * i] as char).to_digit(16)?;
+        let lo = (bytes[2 * i + 1] as char).to_digit(16)?;
+        *slot = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -387,6 +427,31 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn hex_encode_decode_roundtrip() {
+        let pin = sha256_bytes(b"databurg server certificate");
+        let hex = hex_encode(&pin);
+        assert_eq!(hex.len(), 64);
+        assert_eq!(hex_decode32(&hex), Some(pin));
+    }
+
+    #[test]
+    fn hex_decode32_rejects_bad_input() {
+        assert!(hex_decode32("").is_none());
+        assert!(hex_decode32(&"a".repeat(63)).is_none()); // too short
+        assert!(hex_decode32(&"a".repeat(65)).is_none()); // too long
+        assert!(hex_decode32(&"g".repeat(64)).is_none()); // non-hex
+    }
+
+    #[test]
+    fn sha256_hex_is_stable_and_lowercase() {
+        // Known SHA-256 of the empty input.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 
     #[test]
     fn source_path_prefers_byte_exact_os_path() {

@@ -8,6 +8,7 @@ use flate2::read::GzEncoder;
 use flate2::Compression;
 use log::{debug, error};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use std::{error::Error, io::prelude::*, sync::Arc, time::Duration};
@@ -32,65 +33,77 @@ pub enum SendFileError {
     Protocol,
 }
 
-/// Custom certificate verifier that skips server verification.
-/// **Warning:** Using this in production is insecure.
-/// This is only for testing / non-production use.
+/// Verifies the server by pinning its exact certificate: the SHA-256 of the
+/// presented end-entity certificate must equal the configured
+/// `SERVER_CERT_SHA256`. The TLS handshake signature is still checked with the
+/// platform crypto provider, so the peer must also hold the matching private
+/// key. There is no "accept anything" fallback — a client without a configured
+/// pin refuses to connect (see [`connect`]).
 #[derive(Debug)]
-struct SkipServerVerification;
+struct PinnedServerVerification {
+    pinned_sha256: [u8; 32],
+    sig_algs: WebPkiSupportedAlgorithms,
+}
 
-impl SkipServerVerification {
-    /// Creates a new instance of the custom certificate verifier.
-    fn new() -> Arc<Self> {
-        Arc::new(Self)
+impl PinnedServerVerification {
+    fn new(pinned_sha256: [u8; 32]) -> Arc<Self> {
+        Arc::new(Self {
+            pinned_sha256,
+            sig_algs: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms,
+        })
     }
 }
 
-impl ServerCertVerifier for SkipServerVerification {
+impl ServerCertVerifier for PinnedServerVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer,
+        end_entity: &CertificateDer,
         _intermediates: &[CertificateDer],
         _server_name: &ServerName,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        let presented = crate::sha256_bytes(end_entity.as_ref());
+        // Constant-time comparison of the two fixed-length digests.
+        let mut diff = 0u8;
+        for (a, b) in presented.iter().zip(self.pinned_sha256.iter()) {
+            diff |= a ^ b;
+        }
+        if diff == 0 {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            error!(
+                "Server certificate pin mismatch: expected {}, presented {}",
+                crate::hex_encode(&self.pinned_sha256),
+                crate::hex_encode(&presented)
+            );
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_tls12_signature(message, cert, dss, &self.sig_algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_tls13_signature(message, cert, dss, &self.sig_algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
+        self.sig_algs.supported_schemes()
     }
 }
 
@@ -131,11 +144,28 @@ async fn region() -> Result<String, ()> {
 ///
 /// `Ok(TlsStream<TcpStream>)` on success.
 pub async fn connect() -> Result<tokio_rustls::client::TlsStream<TcpStream>, Box<dyn Error>> {
-    // Configure TLS with custom certificate verifier
+    // Pin the server certificate. Without a configured pin we refuse to
+    // connect rather than fall back to trusting any certificate.
+    let pin_hex = env::var("SERVER_CERT_SHA256").map_err(|_| {
+        error!("SERVER_CERT_SHA256 is not configured; refusing to connect without a pinned server certificate");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no server certificate pin configured",
+        )
+    })?;
+    let pinned = crate::hex_decode32(&pin_hex).ok_or_else(|| {
+        error!("SERVER_CERT_SHA256 must be 64 hex characters (SHA-256 of the server certificate)");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid server certificate pin",
+        )
+    })?;
+
+    // Configure TLS with the pinning certificate verifier
     let config = Arc::new(
         ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
+            .with_custom_certificate_verifier(PinnedServerVerification::new(pinned))
             .with_no_client_auth(),
     );
     let tls_connector = TlsConnector::from(config);

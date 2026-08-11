@@ -27,7 +27,6 @@ jobs:
                   sudo apt-get install -y curl llvm-dev libclang-dev clang
                   sudo snap install zig --classic --beta
                   cargo install cargo-zigbuild
-                  echo "" > .env
 
             - name: Add Rust Target
               run: rustup target add ${{matrix.target}}

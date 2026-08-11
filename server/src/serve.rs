@@ -112,7 +112,8 @@ fn setup_tls_acceptor() -> TlsAcceptor {
         cert = fs::read_to_string(cert_file).expect("Could not read certificate file");
     }
 
-    if key.is_empty() || cert.is_empty() {
+    let ephemeral = key.is_empty() || cert.is_empty();
+    if ephemeral {
         log::info!("Generating self-signed certificate");
         (cert, key) = setup_tls_acceptor_self_signed();
     }
@@ -121,6 +122,21 @@ fn setup_tls_acceptor() -> TlsAcceptor {
         .map(|x| x.unwrap())
         .collect::<Vec<_>>();
     let keys = private_key(&mut Cursor::new(key)).unwrap().unwrap();
+
+    // Publish the certificate pin so operators can configure SERVER_CERT_SHA256
+    // on the clients. Clients verify the server against exactly this value.
+    if let Some(leaf) = cert_chain.first() {
+        log::info!(
+            "Server certificate SHA-256 pin: {} (set SERVER_CERT_SHA256 to this on every client)",
+            foundation::sha256_hex(leaf.as_ref())
+        );
+    }
+    if ephemeral {
+        log::warn!(
+            "Using an ephemeral self-signed certificate; its pin changes on every restart. \
+             Set CERTIFICATE_FILE/PRIVATE_KEY_FILE to a persistent certificate in production."
+        );
+    }
 
     // Create a server config and set the certificate and private key
     let config = ServerConfig::builder().with_no_client_auth();
