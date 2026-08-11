@@ -93,6 +93,7 @@ hashes and causes a full one-time re-upload of every account. Use 0.3.1.
 
 ## 0.2.x and earlier
 
-See the commit history. Note that 0.0.1 silently ignores `-c/--config` and
-always reads `/etc/databurg.cnf`; from 0.3.0 on, `-c` is a top-level option
-(`databurg -c FILE backup ...`) and is honoured.
+See the commit history. Note that 0.0.1 accepts `-c/--config` only after the
+subcommand and then silently ignores it, always reading `/etc/databurg.cnf`.
+From 0.3.1 the flag is honoured and accepted on either side of the
+subcommand, so scripts written for 0.0.1 keep working.
