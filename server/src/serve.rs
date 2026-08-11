@@ -14,7 +14,15 @@ use tokio_rustls::TlsAcceptor;
 /// Default cap on concurrently handled connections (override with
 /// `MAX_CONNECTIONS`). Bounds file descriptors, tasks and memory against an
 /// unauthenticated connection flood.
-const DEFAULT_MAX_CONNECTIONS: usize = 128;
+///
+/// Sizing matters: one backup process opens `CONNECTION_COUNT` transfer
+/// connections plus one for preflight (11 today), and a node runs several
+/// backups in parallel — roughly 110 connections per hosting node. The cap must
+/// therefore exceed `nodes x 110` with headroom, or legitimate backups stall
+/// behind the semaphore until they hit their idle timeout. The default is
+/// generous for that reason; raise it explicitly for a larger fleet, and make
+/// sure the service's file-descriptor limit is at least as high.
+const DEFAULT_MAX_CONNECTIONS: usize = 2048;
 /// Time budget for the TLS handshake, so half-open handshakes cannot pin a
 /// connection slot indefinitely.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);

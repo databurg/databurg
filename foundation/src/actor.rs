@@ -813,20 +813,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
     /// - The received message does not match "ACK" or "SKIP".
     pub async fn acked(&mut self) -> Result<AckType, ()> {
         // Ensure the socket is in a readable state
-        self.readable().await.unwrap();
+        self.readable().await.map_err(|_| ())?;
 
         // Buffer to hold the message length prefix
         let mut buf = vec![0; MESSAGE_LENGTH_BYTES];
         // Get a mutable reference to the socket reader
-        let s = self.socket_r.as_mut().unwrap();
-        // Read the length prefix from the socket
-        s.read_exact(&mut buf).await.map_err(|_| ())?;
+        let s = self.socket_r.as_mut().ok_or(())?;
+        // Read the length prefix, dropping the connection if the peer stalls.
+        match tokio::time::timeout(IDLE_TIMEOUT, s.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return Err(()),
+        }
         // Decode the message length using BigEndian
-        let msg_len = BigEndian::read_u32(&buf);
+        let msg_len = BigEndian::read_u32(&buf) as usize;
+        // An acknowledgment is a handful of bytes; refuse to allocate for a
+        // peer-supplied length beyond the frame limit.
+        if msg_len > MAX_MESSAGE_LENGTH {
+            error!("Rejecting oversized acknowledgment frame: {} bytes", msg_len);
+            return Err(());
+        }
         // Buffer to hold the actual acknowledgment message
-        let mut recv_buf = vec![0; msg_len as usize];
+        let mut recv_buf = vec![0; msg_len];
         // Read the acknowledgment message based on the decoded length
-        s.read_exact(&mut recv_buf).await.map_err(|_| ())?;
+        match tokio::time::timeout(IDLE_TIMEOUT, s.read_exact(&mut recv_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return Err(()),
+        }
         // Compare the received message to known acknowledgment types
         if recv_buf == self.ack() {
             Ok(AckType::Ack)
