@@ -92,7 +92,23 @@ This ensures the server runs automatically on system reboot.
 
 ### Purging Obsolete Data
 
-To keep your storage efficient, use a script to remove outdated data: [Purge Script](https://gist.github.com/amallek/749fd7d4da8e23a4319a147705298215).
+There is currently no supported way to reclaim old versions, and **no external
+script should be pointed at the storage tree**. The layout has invariants that
+are not obvious from the outside: a blob that is not the `latest` target is
+still the correct answer for a point-in-time restore, so removing an
+intermediate version makes recovery return *older bytes with no error*. Object
+directories, `.deleted`, `.deletion.history` and `.<bucket>.meta` are equally
+load-bearing — the deletion timeline exists nowhere else, and a lost
+`.<bucket>.meta` permanently stops deleted files from ever being marked deleted.
+
+Only `.tmp-*` files inside object directories are provably unreferenced (crash
+residue from an interrupted upload) and safe to remove at any time.
+
+Storage grows with real churn: an unchanged file costs nothing on a nightly run.
+The dominant avoidable growth comes from deploys that rewrite modification times
+(`tar` extracts, non-preserving copies) — every touched file becomes a new
+version even when its bytes are unchanged. Preferring `rsync -a` on the source
+side reclaims more than any purge would.
 
 ## Databurg Client
 

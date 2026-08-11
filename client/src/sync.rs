@@ -18,7 +18,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -34,8 +33,6 @@ use walkdir::WalkDir;
 const CONNECTION_COUNT: usize = 10;
 /// Size of the local thread pool that walks and hashes files.
 const HASH_POOL_SIZE: usize = 8;
-/// How much leading file content goes into the change-detection hash.
-const HASH_HEAD_BYTES: usize = 256 * 1024;
 /// How often a single file is retried before it counts as failed.
 const MAX_RETRIES: u8 = 3;
 /// Upper bound on individually listed files in the final failure report.
@@ -229,7 +226,7 @@ fn build_job(path: PathBuf, bucket: String, unreadable: &Arc<Mutex<Vec<String>>>
     };
     let modified = meta.modified().unwrap_or(UNIX_EPOCH);
 
-    let file_hash = match hash_file(&target, &meta, modified) {
+    let file_hash = match hash_file(&target, modified) {
         Ok(hash) => hash,
         Err(e) => {
             record_unreadable(unreadable, &target, "read", &e.to_string());
@@ -259,35 +256,35 @@ fn build_job(path: PathBuf, bucket: String, unreadable: &Arc<Mutex<Vec<String>>>
     })
 }
 
-/// Computes the change-detection hash of one file from its size, modification
-/// time, raw name bytes and leading content.
+/// Computes the version identifier of one file from its modification time and
+/// name — deliberately byte-compatible with every released version.
 ///
-/// The leading-content window matters: size and mtime alone miss an edit made
-/// within the same wall-clock second, and hashing the whole file every night
-/// would be wasteful. The name is fed in as raw bytes so that names which are
-/// not valid UTF-8 still contribute.
-fn hash_file(
-    path: &Path,
-    meta: &fs::Metadata,
-    modified: std::time::SystemTime,
-) -> std::io::Result<String> {
-    let mut file = fs::File::open(path)?;
+/// This value is what preflight compares against, and it also names the stored
+/// blob, so changing the formula would invalidate every hash the server already
+/// holds: each client would re-upload its entire corpus once, and (since old
+/// versions are never reclaimed) that storage would be occupied permanently.
+/// The formula therefore stays exactly as it was.
+///
+/// The one deviation is deliberate and does not affect valid UTF-8 names: the
+/// name is fed in as raw bytes, where earlier versions used `to_str()` and so
+/// silently contributed *nothing* for names that are not valid UTF-8 — making
+/// all such files in a directory share a hash whenever their mtimes matched.
+/// For every name that is valid UTF-8 the hashed bytes are identical, so the
+/// existing corpus keeps its hashes.
+///
+/// The file is opened but not read: opening is the readability check that makes
+/// an unreadable file a reported failure rather than a silent omission.
+fn hash_file(path: &Path, modified: std::time::SystemTime) -> std::io::Result<String> {
+    let file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
 
-    hasher.update(meta.len().to_le_bytes());
     let modified: DateTime<Utc> = modified.into();
     hasher.update(modified.format("%Y-%m-%d %H:%M:%S").to_string());
     if let Some(name) = path.file_name() {
         hasher.update(name.as_bytes());
     }
 
-    let capacity = (meta.len() as usize).min(HASH_HEAD_BYTES);
-    let mut head = Vec::with_capacity(capacity);
-    file.by_ref()
-        .take(HASH_HEAD_BYTES as u64)
-        .read_to_end(&mut head)?;
-    hasher.update(&head);
-
+    drop(file);
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -553,4 +550,89 @@ fn report_result(mut outcome: DispatchOutcome, unreadable: Vec<String>) -> Resul
         );
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Replicates the version-identifier formula EXACTLY as every released
+    /// version computed it (mtime formatted, then the file name via `to_str`).
+    /// Kept verbatim so the test fails loudly if `hash_file` ever drifts from
+    /// the released formula and would invalidate the server's stored hashes.
+    fn released_formula(path: &Path, modified: std::time::SystemTime) -> String {
+        let mut hasher = Sha256::new();
+        let modified: DateTime<Utc> = modified.into();
+        hasher.update(modified.format("%Y-%m-%d %H:%M:%S").to_string());
+        if let Some(name) = path.file_name().unwrap().to_str() {
+            hasher.update(name);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn write_temp(name: &str, contents: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("databurg-hash-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn hash_matches_the_released_formula() {
+        // A file whose name is valid UTF-8 — i.e. essentially the whole corpus
+        // already stored on the backup server. Its hash MUST NOT change, or
+        // every client re-uploads everything once and that storage is never
+        // reclaimed.
+        let path = write_temp("index.html", b"<html>hello</html>");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(
+            hash_file(&path, modified).unwrap(),
+            released_formula(&path, modified),
+            "the version identifier drifted from the released formula"
+        );
+    }
+
+    #[test]
+    fn hash_ignores_content_so_stored_hashes_stay_valid() {
+        // Two files with the same name and mtime but different content hash
+        // alike: content is deliberately NOT part of the identifier, exactly as
+        // in the released versions.
+        let a = write_temp("same-name.txt", b"one");
+        let modified = fs::metadata(&a).unwrap().modified().unwrap();
+        let first = hash_file(&a, modified).unwrap();
+
+        let mut f = fs::OpenOptions::new().write(true).truncate(true).open(&a).unwrap();
+        f.write_all(b"completely different content").unwrap();
+        drop(f);
+
+        assert_eq!(hash_file(&a, modified).unwrap(), first);
+    }
+
+    #[test]
+    fn non_utf8_names_contribute_to_the_hash() {
+        // Earlier versions dropped the name entirely when it was not valid
+        // UTF-8, so such files collided whenever their mtimes matched. Raw
+        // bytes fix that; valid-UTF-8 names are unaffected (see the test above).
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw_a = OsString::from_vec(vec![b'a', 0xE4, b'.', b't', b'x', b't']);
+        let raw_b = OsString::from_vec(vec![b'b', 0xE4, b'.', b't', b'x', b't']);
+        let pa = write_temp(&raw_a.to_string_lossy(), b"x");
+        let pb = write_temp(&raw_b.to_string_lossy(), b"x");
+        let m = fs::metadata(&pa).unwrap().modified().unwrap();
+
+        assert_ne!(hash_file(&pa, m).unwrap(), hash_file(&pb, m).unwrap());
+    }
+
+    #[test]
+    fn unreadable_file_is_an_error_not_a_silent_skip() {
+        let missing = std::env::temp_dir().join("databurg-hash-does-not-exist");
+        let _ = fs::remove_file(&missing);
+        assert!(hash_file(&missing, std::time::SystemTime::now()).is_err());
+    }
 }

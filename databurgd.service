@@ -1,12 +1,18 @@
 [Unit]
 Description=databurg
 Wants=network-online.target
+After=network-online.target
+
 [Service]
 Type=simple
 Restart=always
+RestartSec=5
 ExecStart=/usr/local/bin/databurgd -c /etc/databurg.cnf
 ExecStop=/bin/kill -2 $MAINPID
 WorkingDirectory=/etc
+# Each accepted connection costs a file descriptor; the default 1024 would cap
+# the server far below MAX_CONNECTIONS and reject legitimate backups.
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
