@@ -1,19 +1,22 @@
+use crate::{
+    encode_raw_path, resolve_raw_entry, sanitize_wire_path, tail_components, BucketStatus,
+    FileSelector, SyncMetadata,
+};
 #[allow(unused_imports)]
 use crate::{
     env, truncate_to_seconds, Action, Actor, AuthenticationData, CommandData, FileActionData,
     FileInfo, HandshakeData, InnerJob, Job, ObjectMetadata, PreflightRequestData, Status,
 };
-use crate::{BucketStatus, FileSelector, SyncMetadata};
 use flate2::read::GzDecoder;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io::prelude::*;
 use std::os::unix::fs::{chown, symlink, PermissionsExt};
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -81,20 +84,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         }
     }
 
-    /// Constructs the file path based on the storage directory, bucket, and file name.
-    fn file_path(&self, bucket: String, file: String) -> PathBuf {
-        let mut path = PathBuf::new();
-        path.push(&self.storage_dir);
-        path.push(bucket);
-        path.push(file);
+    /// Absolute directory of one stored object: storage root plus sanitized
+    /// bucket plus sanitized relative path. Every peer-supplied component is
+    /// funneled through here so nothing can escape the storage root.
+    fn object_dir(&self, bucket: &str, rel: &Path) -> PathBuf {
+        let mut path = PathBuf::from(&self.storage_dir);
+        path.push(sanitize_wire_path(Path::new(bucket)));
+        path.push(sanitize_wire_path(rel));
+        path
+    }
+
+    /// Destination a recovered file is written to on the client: the recovery
+    /// root (`storage_dir` holds the client's destination directory here) plus
+    /// the server-supplied relative path, taken byte-exact from the raw field
+    /// and stripped of absolute or parent components so a malicious or spoofed
+    /// server cannot write outside the destination.
+    fn recover_dest(&self, job: &InnerJob) -> PathBuf {
+        let mut path = PathBuf::from(&self.storage_dir);
+        path.push(job.wire_path());
         path
     }
 
     /// Sets a delete marker for the specified file in the given bucket.
     /// This function creates a `.deleted` file in the file's directory.
-    async fn set_delete_marker(&mut self, bucket: String, file: String) -> tokio::io::Result<()> {
+    async fn set_delete_marker(&mut self, bucket: String, file: &Path) -> tokio::io::Result<()> {
         // Construct the path to the .deleted file
-        let mut path = self.file_path(bucket, file);
+        let mut path = self.object_dir(&bucket, file);
         path.push(".deleted");
 
         // Create the .deleted file and write "deleted" to it
@@ -322,10 +337,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
     }
 
     /// Constructs the path to the metadata file for the specified bucket.
-    /// This function creates a `.meta` file path in the storage directory.
+    /// The bucket is peer-supplied, so it is reduced to a single sanitized
+    /// component before it becomes part of the `.meta` file name; otherwise a
+    /// bucket containing `/` or `..` could steer the write out of the storage
+    /// root (this stage runs without bucket auth).
     fn meta_path(&self, bucket: String) -> PathBuf {
+        let safe = sanitize_wire_path(Path::new(&bucket));
+        let name = safe.to_string_lossy();
         let mut path = PathBuf::from(&self.storage_dir);
-        path.push(format!(".{}.meta", bucket));
+        path.push(format!(".{}.meta", name));
         path
     }
 
@@ -371,21 +391,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
     pub async fn get_files_from_query(&mut self, query: &FileSelector) -> Vec<FileInfo> {
         let query_path = query.path.clone();
         let query_bucket = query.bucket.clone();
+        let prefix = query_bucket.as_str();
         let point_in_time: Option<SystemTime> = query
             .point_in_time
             .map(|p| p.checked_add(Duration::from_secs(1)).unwrap());
 
-        let prefix = query_bucket.as_str();
-        let mut path = std::path::PathBuf::from(self.storage_dir.clone());
-        path.push(prefix);
-
-        if query_path != "." && query_path != "/" {
-            path.push(query_path);
-        }
-
         let mut files_vec: Vec<FileInfo> = vec![];
 
-        // Additional security
+        // Both the bucket and the requested sub-path come from the peer;
+        // sanitizing each to its normal components keeps the walk inside the
+        // storage root even if `starts_with` (which does not resolve `..`)
+        // would let a lexical escape through. A bucket that sanitizes to
+        // nothing (empty, ".", "..") would otherwise point the walk at the
+        // whole storage root and enumerate every bucket.
+        let safe_bucket = sanitize_wire_path(Path::new(&query_bucket));
+        if safe_bucket.as_os_str().is_empty() {
+            error!("Rejecting empty/invalid bucket name");
+            return files_vec;
+        }
+        let mut path = std::path::PathBuf::from(self.storage_dir.clone());
+        path.push(&safe_bucket);
+
+        if query_path != "." && query_path != "/" {
+            path.push(sanitize_wire_path(Path::new(&query_path)));
+        }
+
+        // Additional security: defence in depth on top of the sanitizing above
         let ls = format!("{}", self.storage_dir.clone());
         if !path.starts_with(ls.clone()) {
             error!("Path does not start with {}.. {:?}", ls, path.to_str());
@@ -457,11 +488,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 return Ok(None);
             }
 
-            // Construct the FileInfo object
+            // Construct the FileInfo object. pick_version works on the real
+            // Path: the display form is lossy for raw-named directories.
             let physical_path = e.display().to_string();
             let file_info = FileInfo {
                 file_name: physical_path.replace(prefix, ""),
-                path_internal: self.pick_version(&physical_path, point_in_time),
+                path_internal: self.pick_version(e, point_in_time),
                 bucket: query_bucket,
                 meta,
             };
@@ -477,7 +509,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
     /// Picks the appropriate version of a file based on the provided directory and point in time.
     /// If a point in time is provided, it selects the latest version before that time.
     /// If no point in time is provided, it selects the "latest" symlink if it exists.
-    fn pick_version(&mut self, dir: &str, point_in_time: Option<SystemTime>) -> Option<PathBuf> {
+    fn pick_version(&mut self, dir: &Path, point_in_time: Option<SystemTime>) -> Option<PathBuf> {
         let mut latest = None;
         let mut latest_time = SystemTime::UNIX_EPOCH;
 
@@ -517,7 +549,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                     }
                 }
             } else if filename == "latest" {
-                let mut path = PathBuf::from(dir);
+                let mut path = dir.to_path_buf();
                 if let Ok(link) = entry.path().read_link() {
                     path.push(link);
                 }
@@ -536,13 +568,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         cad: Option<FileActionData>,
     ) -> Result<Option<tokio::fs::File>, ()> {
         let job_inner = cad.unwrap().job.clone();
-        let new_file_hash = job_inner.file_hash.clone().unwrap();
-        let mut path = PathBuf::new();
-
-        // Construct the full path to the file
-        path.push(&self.storage_dir);
-        path.push(job_inner.bucket.clone().unwrap());
-        path.push(job_inner.file_path.clone().unwrap());
+        let new_file_hash = job_inner.file_hash.clone().unwrap_or_default();
+        // The hash becomes the blob file name; reject anything that is not a
+        // plain 64-hex digest so it cannot carry `/` or `..`.
+        if !crate::is_valid_hash(&new_file_hash) {
+            error!("Rejecting job with invalid file hash");
+            return Err(());
+        }
+        // Construct the full path to the file. object_dir() sanitizes the
+        // bucket and prefers the byte-exact raw path, stripping absolute or
+        // parent components, so a client cannot write outside the storage root.
+        let mut path = self.object_dir(
+            job_inner.bucket.as_deref().unwrap_or_default(),
+            &job_inner.wire_path(),
+        );
 
         // Create necessary directories
         if let Err(e) = fs::create_dir_all(&path) {
@@ -585,35 +624,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         Ok(fd)
     }
 
+    /// Creates an empty recovered file (the zero-length case of recover) at the
+    /// sanitized destination and applies its stored ownership and mode.
     async fn client_init_file(
         &mut self,
         cad: Option<FileActionData>,
     ) -> Result<std::option::Option<tokio::fs::File>, ()> {
         let job_inner = cad.unwrap().job.clone();
-        let mut path = std::path::PathBuf::new();
-        // /path/to/file.txt will become
-        // /data_dir/path/to/file.txt/
-        path.push(&self.storage_dir);
-        path.push(job_inner.bucket.unwrap());
-        path.push(job_inner.file_path.clone().unwrap());
+        // recover_dest() takes the byte-exact relative path and strips
+        // absolute or parent components, so a spoofed server cannot write
+        // outside the recovery destination.
+        let path = self.recover_dest(&job_inner);
 
-        let path1 = path.clone();
-        let filename = path1.iter().last().unwrap().to_str().unwrap();
-        path.pop();
-
-        match fs::create_dir_all(path.clone()) {
-            Ok(_) => {}
-            Err(e) => {
-                info!(
-                    "Could not create directory {}: {:?}",
-                    path.display().to_string(),
-                    e
-                );
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                info!("Could not create directory {}: {:?}", parent.display(), e);
                 return Err(());
             }
         }
-
-        path.push(filename);
 
         let real_file_path = path.clone();
         let fd = match File::create(real_file_path.clone()).await {
@@ -624,11 +652,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                     path.display().to_string(),
                     e
                 );
-                None
+                return Err(());
             }
         };
 
-        let real_file_path = real_file_path.canonicalize().unwrap();
+        let real_file_path = match real_file_path.canonicalize() {
+            Ok(path) => path,
+            Err(e) => {
+                error!("Could not canonicalize {}: {:?}", path.display(), e);
+                return Err(());
+            }
+        };
 
         _ = self
             .apply_permissions(
@@ -834,15 +868,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 hasher.update(auth_token);
                 let auth_token_hash = format!("{:x}", hasher.finalize());
 
-                // Find bucket's (|bucket|) auth token hash
+                // Find bucket's (|bucket|) auth token hash. The bucket name is
+                // peer-supplied and becomes part of both paths below (one of
+                // which is written to), so reduce it to a single sanitized
+                // component first — otherwise `..` in the bucket would steer
+                // the `.auth` write outside the storage root.
+                let safe_bucket = sanitize_wire_path(Path::new(&bucket));
+                if safe_bucket.as_os_str().is_empty() {
+                    error!("Rejecting empty/invalid bucket name");
+                    return Err(());
+                }
+                let safe_bucket = safe_bucket.to_string_lossy();
 
                 // - Build Path
                 let mut bucket_path = std::path::PathBuf::new();
                 bucket_path.push(&self.storage_dir);
-                bucket_path.push(bucket.clone());
+                bucket_path.push(safe_bucket.as_ref());
 
                 let mut auth_path = PathBuf::from(&self.storage_dir);
-                auth_path.push(format!(".{}.auth", bucket));
+                auth_path.push(format!(".{}.auth", safe_bucket));
 
                 // - Check if Path exists
                 // - If path does not exists, add a .auth file and write the hash (only on write operations, not on list/status/preflight)
@@ -975,10 +1019,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                         let mut retained_files = vec![];
                         for f in file_list.iter() {
                             let bucket = query.bucket.clone();
-                            let mut path = std::path::PathBuf::new();
-                            path.push(&self.storage_dir);
-                            path.push(&bucket);
-                            path.push(&f.file_path);
+
+                            // A malformed hash would otherwise let this
+                            // existence check probe arbitrary paths (it becomes
+                            // the last path component below); treat it as
+                            // "server needs it" and move on.
+                            if !crate::is_valid_hash(&f.file_hash) {
+                                retained_files.push(f.clone());
+                                continue;
+                            }
+
+                            let path = self.object_dir(&bucket, &f.wire_path());
                             let path = path.canonicalize();
 
                             // Do authentication
@@ -1054,18 +1105,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                     Ok(meta) => {
                         // Get all files associated available on the client
                         // side and figure out which files where deleted in
-                        // the meantime
+                        // the meantime. Compared on raw path bytes: names
+                        // that are not valid UTF-8 arrive lossy in file_list
+                        // and byte-exact in file_list_raw.
                         if let Some(all_files) = meta.clone().file_list {
+                            let current: HashSet<PathBuf> = all_files
+                                .iter()
+                                .map(|file| resolve_raw_entry(file, &meta.file_list_raw))
+                                .collect();
                             let existing_meta: Vec<SyncMetadata> =
                                 self.read_meta(meta.bucket.clone()).await;
                             if existing_meta.len() > 0 {
                                 let last_sync = existing_meta.last().unwrap();
                                 if let Some(last_file_list) = last_sync.file_list.clone() {
                                     for file in last_file_list.iter() {
-                                        if !all_files.contains(&file) {
+                                        let last_path =
+                                            resolve_raw_entry(file, &last_sync.file_list_raw);
+                                        if !current.contains(&last_path) {
                                             // File was deleted
                                             _ = self
-                                                .set_delete_marker(meta.bucket.clone(), file.into())
+                                                .set_delete_marker(meta.bucket.clone(), &last_path)
                                                 .await;
                                         }
                                     }
@@ -1109,20 +1168,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 *current_action_data = ad.ok();
                 self.reset_fd(fd).await;
                 let cad = current_action_data.clone().unwrap();
-                let mut path = std::path::PathBuf::new();
                 let bucket = cad.job.bucket.clone().unwrap();
 
-                path.push(&self.storage_dir);
-                path.push(bucket.clone());
-
-                if self.handle_bucket_auth(bucket, true).await.is_err() {
+                if self.handle_bucket_auth(bucket.clone(), true).await.is_err() {
                     // Auth for bucket/auth_token combination failed.
                     self.actor.send_nack().await;
                     return Ok(Stage::Command);
                 }
 
-                path.push(cad.job.file_path.clone().unwrap());
-                path.push(cad.job.file_hash.clone().unwrap());
+                // Same byte-exact, sanitized layout as init_file, so the
+                // existence/dedup check below actually finds the object that
+                // was stored and clears its delete marker. A malformed hash
+                // is rejected before it can become part of the path.
+                let file_hash = cad.job.file_hash.clone().unwrap_or_default();
+                if !crate::is_valid_hash(&file_hash) {
+                    error!("Rejecting job with invalid file hash");
+                    self.actor.send_nack().await;
+                    return Ok(Stage::Command);
+                }
+                let mut path = self.object_dir(&bucket, &cad.job.wire_path());
+                path.push(&file_hash);
 
                 if path.exists() {
                     _ = self.unset_delete_marker(path.clone()).await;
@@ -1321,6 +1386,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                         uid: meta.uid,
                         gid: meta.gid,
                         file_path: Some(file_path.clone()),
+                        file_path_raw: None,
+                        file_path_os: Some(file.clone()),
                         bucket: Some(bucket),
                         retries: 0,
                         is_dir: false,
@@ -1331,12 +1398,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 let mut inner = InnerJob::default();
                 inner.bucket = Some(bucket.clone());
                 inner.file_path = Some(file_path.clone());
+                inner.file_path_os = Some(file.clone());
                 inner.file_hash = Some(file_hash);
                 inner.job_id = Some(job_id);
                 job = Job {
                     inner,
                     status_sender: None,
                 };
+            }
+
+            // Byte-exact companion for the (lossy) `target` the client will
+            // recreate. `target` is the tail of the stored object directory
+            // after the storage-root and query-prefix stripping above, so the
+            // same number of trailing components of the blob's byte-exact
+            // parent path reproduces it exactly. Only carried when the name is
+            // not valid UTF-8, so legacy clients are unaffected.
+            let mut job = job;
+            if let Some(object_dir) = file.parent() {
+                let depth = Path::new(&target).components().count();
+                let raw_rel: PathBuf = tail_components(object_dir, depth);
+                if raw_rel.to_str().is_none() {
+                    job.inner.file_path_raw = Some(encode_raw_path(&raw_rel));
+                }
             }
 
             job_id += 1;
@@ -1374,12 +1457,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 *current_action_data = ad.ok();
                 self.reset_fd(fd).await;
 
-                let mut cad = current_action_data.clone().unwrap();
-                let mut path = std::path::PathBuf::new();
-
-                path.push(&self.storage_dir.clone().as_str());
-                path.push(cad.job.file_path.clone().unwrap().to_string());
-                cad.job.file_path = Some(path.display().to_string());
+                // Keep the job as received: file_path stays the relative wire
+                // path (plus its raw companion) so the writer can rebuild the
+                // byte-exact, sanitized destination via recover_dest().
+                let cad = current_action_data.clone().unwrap();
 
                 *await_bytes = cad.file_size.unwrap() as usize;
                 if *await_bytes == 0 {
@@ -1417,30 +1498,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 let buf = decompress_data(&buf);
                 if fd.is_none() {
                     *fd_pos = 0;
-                    //let job_inner = current_action_data.clone().unwrap().job.clone();
-                    let target_filename = current_action_data
-                        .clone()
-                        .unwrap()
-                        .job
-                        .file_path
-                        .clone()
-                        .unwrap();
+                    // Byte-exact, sanitized destination: recover_dest() strips
+                    // any absolute or parent components the server sent, so the
+                    // write stays inside the recovery directory.
+                    let job = current_action_data.clone().unwrap().job;
+                    let path = self.recover_dest(&job);
 
-                    let target_dir =
-                        target_filename[..target_filename.rfind("/").unwrap()].to_string();
-
-                    let path = std::path::PathBuf::from_str(&target_filename).unwrap();
-                    match fs::create_dir_all(target_dir) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            info!(
-                                "Could not create directory {}: {:?}",
-                                path.display().to_string(),
-                                e
-                            );
-                            // current_stage = Stage::Command;
+                    if let Some(parent) = path.parent() {
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            info!("Could not create directory {}: {:?}", parent.display(), e);
                             self.actor.send_nack().await;
-                            // continue 'mainloop;
                             return Ok(Some(Stage::Command));
                         }
                     }
