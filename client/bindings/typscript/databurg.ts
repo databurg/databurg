@@ -1,4 +1,5 @@
 import * as tls from 'tls';
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 
 const REQUEST_TIMEOUT_MS = 3000;
@@ -7,7 +8,14 @@ const MESSAGE_LENGTH_BYTES = 4;
 interface TLSClientOptions {
     host: string;
     port: number;
-    ca?: string;
+    /**
+     * SHA-256 of the server's TLS certificate, 64 hex characters — the same pin
+     * the Rust client verifies via SERVER_CERT_SHA256. The server presents a
+     * self-signed certificate, so this pin, not a CA chain, is what establishes
+     * trust. Required: without it the connection is refused rather than falling
+     * back to trusting any certificate.
+     */
+    certSha256: string;
 }
 
 export type SystemTime = {
@@ -70,13 +78,15 @@ export default class Databurg {
     private port: number
     private auth_token: string
     private bucket: string
+    private cert_sha256: string
     private client: TLSClient | null = null
 
-    constructor({ endpoint, auth_token, bucket }: { endpoint: string, auth_token: string, bucket: string }) {
+    constructor({ endpoint, auth_token, bucket, cert_sha256 }: { endpoint: string, auth_token: string, bucket: string, cert_sha256: string }) {
         this.auth_token = auth_token
         this.endpoint = endpoint
         this.port = 2403
         this.bucket = bucket
+        this.cert_sha256 = cert_sha256
     }
 
     private async connect() {
@@ -85,21 +95,21 @@ export default class Databurg {
         let client = new TLSClient({
             host: this.endpoint || '127.0.0.1',
             port: this.port || 2403,
+            certSha256: this.cert_sha256,
         });
 
-        try {
-            await client.connect();
-            this.client = client
+        // A failure here must propagate: swallowing it would leave this.client
+        // null and every later call would fail with a confusing "not connected"
+        // instead of the real cause (a pin mismatch, for example).
+        await client.connect();
+        this.client = client
 
-            if (!(await this.handshake())) {
-                throw new Error("Handshake failed")
-            }
+        if (!(await this.handshake())) {
+            throw new Error("Handshake failed")
+        }
 
-            if (!(await this.authenticate())) {
-                throw new Error("Authentication failed")
-            }
-        } catch (error) {
-            console.error('Failed to connect or send request:', error.message);
+        if (!(await this.authenticate())) {
+            throw new Error("Authentication failed")
         }
     }
 
@@ -159,22 +169,53 @@ class TLSClient {
     private socket: tls.TLSSocket | null = null
     private host: string
     private port: number
+    private certSha256: string
     private responseEmitter = new EventEmitter()
 
     constructor(options: TLSClientOptions) {
         this.host = options.host
         this.port = options.port
+        this.certSha256 = (options.certSha256 || '').trim().toLowerCase()
     }
 
     async connect(): Promise<void> {
+        if (!/^[0-9a-f]{64}$/.test(this.certSha256)) {
+            throw new Error(
+                'certSha256 must be the 64 hex characters of the server certificate SHA-256; ' +
+                'refusing to connect without a pinned server certificate'
+            )
+        }
+
         try {
             return new Promise((resolve, reject) => {
                 const options: tls.ConnectionOptions = {
                     host: this.host,
                     port: this.port,
+                    // The server presents a self-signed certificate, so a CA
+                    // chain cannot verify it. Trust is established by comparing
+                    // the certificate against the configured pin below — never
+                    // by accepting whatever is presented.
                     rejectUnauthorized: false,
                 }
-                this.socket = tls.connect(options, () => { resolve() })
+                this.socket = tls.connect(options, () => {
+                    const presented = this.socket!.getPeerCertificate()
+                    if (!presented || !presented.raw) {
+                        this.socket!.destroy()
+                        return reject(new Error('Server presented no certificate'))
+                    }
+
+                    const actual = crypto.createHash('sha256').update(presented.raw).digest()
+                    const expected = Buffer.from(this.certSha256, 'hex')
+                    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+                        this.socket!.destroy()
+                        return reject(new Error(
+                            `Server certificate pin mismatch: expected ${this.certSha256}, ` +
+                            `presented ${actual.toString('hex')}`
+                        ))
+                    }
+
+                    resolve()
+                })
                 this.socket!.on('error', (err) => err.code == 'ECONNREFUSED' ? reject(err) : this.responseEmitter.emit('error', err))
                 this.socket.on('data', (data) => this.responseEmitter.emit('response', data))
             })

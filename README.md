@@ -158,6 +158,12 @@ Databurg is configured at runtime from a config file (`/etc/databurg.cnf` by
 default, or `-c <path>`). Nothing is compiled into the binaries, and a missing or
 unreadable config file is a fatal error. See [`databurg.cnf.sample`](./databurg.cnf.sample).
 
+> **`-c` is a top-level option and must precede the subcommand:**
+> `databurg -c /etc/databurg.cnf backup -s … -b …`.
+> Release 0.0.1 accepted `-c` *after* the subcommand and then silently ignored
+> it, always reading `/etc/databurg.cnf`. Scripts written against that release
+> must be adjusted when upgrading, or the client exits with a usage error.
+
 - `SERVER_HOSTNAME`: Server IP address or hostname.
 - `SERVER_PORT`: Server listening port (default: 2403).
 - `PRE_SHARED_SECURITY_TOKEN`: Security token for authentication.
