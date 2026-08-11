@@ -138,17 +138,25 @@ databurg recover -b MyBucket -s ./ -d ./test-recover -t 1730925459 [-c /etc/data
 
 ## Configuration Guidelines
 
-Databurg is configured using environment variables set in a `.env` file located in the project's root directory:
+Databurg is configured at runtime from a config file (`/etc/databurg.cnf` by
+default, or `-c <path>`). Nothing is compiled into the binaries, and a missing or
+unreadable config file is a fatal error. See [`databurg.cnf.sample`](./databurg.cnf.sample).
 
 - `SERVER_HOSTNAME`: Server IP address or hostname.
 - `SERVER_PORT`: Server listening port (default: 2403).
 - `PRE_SHARED_SECURITY_TOKEN`: Security token for authentication.
+- `SERVER_CERT_SHA256`: **Client, required.** SHA-256 of the server's TLS
+  certificate — the pin the client verifies the server against. The client
+  refuses to connect without it, and rejects any server whose certificate does
+  not match. `databurgd` logs this value at startup (`RUST_LOG=info`), or derive
+  it with `openssl x509 -in cert.pem -outform DER | sha256sum`.
 - `SERVER_LISTEN`: IP address for server binding (default: 0.0.0.0).
 - `STORAGE_BASE_DIR`: Base directory for data storage.
-- `CERTIFICATE_FILE`: Path to a custom TLS certificate (optional).
-- `PRIVATE_KEY_FILE`: Path to a custom TLS private key (optional).
-
-> **Note**: Avoid setting `PRE_SHARED_SECURITY_TOKEN` in your `.env` file during compile time, as it may be embedded in the compiled binary, posing a security risk.
+- `MAX_CONNECTIONS`: Server: cap on concurrent connections (default: 128).
+- `CERTIFICATE_FILE`: Path to a TLS certificate. **Required in production** —
+  without it the server generates an ephemeral self-signed certificate whose pin
+  changes on every restart, which breaks pinned clients.
+- `PRIVATE_KEY_FILE`: Path to the matching TLS private key.
 
 To use a custom configuration file:
 
