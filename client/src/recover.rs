@@ -56,7 +56,9 @@ pub async fn handler(args: &ArgMatches) -> Result<(), ()> {
         }),
     };
 
-    let tls_stream = actor::connect().await.unwrap();
+    // A server that is down or fails the certificate pin is an ordinary
+    // operational condition; the cause is already logged by connect().
+    let tls_stream = actor::connect().await.map_err(|_| ())?;
     let mut a = Actor::new(tokio_rustls::TlsStream::Client(tls_stream));
     if a.handshake().await.is_err() {
         return Err(());

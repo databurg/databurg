@@ -43,12 +43,18 @@ fn dest_arg() -> Arg {
         .global(true)
 }
 
-// Reusable argument for config file
+// Reusable argument for config file.
+//
+// Global so that it is accepted both before and after the subcommand. Release
+// 0.0.1 registered it on the subcommands, so deployed scripts pass it as
+// `databurg backup -c FILE ...`; rejecting that form would break every existing
+// cron runner on upgrade.
 fn conf_arg() -> Arg {
     Arg::new("conf")
         .short('c')
         .long("config")
         .help("Specify config file")
+        .global(true)
 }
 
 // Reusable argument for tags
@@ -98,8 +104,17 @@ async fn main() -> Result<(), ()> {
 
     // Load configuration from the config file. There is no embedded fallback,
     // so a missing or unreadable config is fatal.
+    //
+    // Look in the subcommand's matches as well: `-c` is accepted on both sides
+    // of the subcommand, and which set of matches carries it depends on where
+    // it was given. Scripts written for 0.0.1 pass it after the subcommand.
     let config_file = matches
         .get_one::<String>("conf")
+        .or_else(|| {
+            matches
+                .subcommand()
+                .and_then(|(_, sub)| sub.get_one::<String>("conf"))
+        })
         .map(|s| s.as_str())
         .unwrap_or("/etc/databurg.cnf");
     if let Err(e) = env::load_config(config_file) {
