@@ -6,6 +6,7 @@ repository = "https://github.com/databurg/databurg"
 license = "Apache-2.0"
 
 [dependencies]
+base64 = "0.22.1"
 byteorder = "1.5.0"
 log = "0.4.27"
 serde = {version = "1.0.219", features = ["derive"]}

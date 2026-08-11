@@ -23,6 +23,16 @@ use tokio_rustls::{TlsConnector, TlsStream};
 pub const MESSAGE_LENGTH_BYTES: usize = 4;
 pub const DEFAULT_CHUNK_SIZE: usize = 2_097_152; // 2 MB
 
+/// Why [`Actor::send_file`] failed.
+#[derive(Debug)]
+pub enum SendFileError {
+    /// The source file could not be opened or read before anything was
+    /// written to the connection, so the connection is still usable.
+    Unreadable(std::io::Error),
+    /// The connection failed or is desynced mid-transfer.
+    Protocol,
+}
+
 /// Verifies the server by pinning its exact certificate: the SHA-256 of the
 /// presented end-entity certificate must equal the configured
 /// `SERVER_CERT_SHA256`. The TLS handshake signature is still checked with the
@@ -401,7 +411,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
                                         error!("Failed to send failure acknowledgment: {:?}", e);
                                     }
                                 }
-                                return;
+                                // A locally unreadable file has not touched the
+                                // connection, so this actor can keep processing
+                                // jobs. Anything else left the stream in an
+                                // undefined state and the actor must stop.
+                                if !matches!(e, SendFileError::Unreadable(_)) {
+                                    return;
+                                }
                             }
                         }
                     } else {
@@ -510,35 +526,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
     ///
     /// # Returns
     ///
-    /// `Ok(u64)` containing the number of bytes sent, or `Err(())` on failure.
+    /// `Ok(u64)` containing the number of bytes sent, or a [`SendFileError`]
+    /// saying whether the connection survived the failure.
     pub async fn send_file(
         &mut self,
         mut job: Job,
         target_filename: Option<String>,
-    ) -> Result<u64, ()> {
-        // Retrieve the source file path from the job
-        let source = job.inner.file_path.clone().unwrap();
+    ) -> Result<u64, SendFileError> {
+        // Retrieve the source file path from the job. Opening uses the
+        // byte-exact OS path where available; the wire string is lossy for
+        // file names that are not valid UTF-8.
+        let source = job.inner.source_path();
+        let source_display = source.display().to_string();
 
         // Open the file asynchronously
-        let mut f = File::open(source.clone()).await.map_err(|_| {
-            error!("Cannot open file {}", source);
-            ()
+        let mut f = File::open(&source).await.map_err(|e| {
+            error!("Cannot open file {}: {}", source_display, e);
+            SendFileError::Unreadable(e)
         })?;
 
         // Get the file length
-        let len = f.metadata().await.unwrap().len();
+        let len = match f.metadata().await {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                error!("Cannot read metadata of {}: {}", source_display, e);
+                return Err(SendFileError::Unreadable(e));
+            }
+        };
         let mut len_read = 0;
 
         // If target_filename is provided, update the job's file_path
         if target_filename.is_none() {
             // Send a sync command to the server
-            self.send_cmd(Action::Sync).await?;
+            self.send_cmd(Action::Sync)
+                .await
+                .map_err(|_| SendFileError::Protocol)?;
         } else {
             job.inner.file_path = target_filename.clone();
         }
 
         // Send file action data and check if the server wants to skip
-        let skip_indicator = self.send_file_action_data(job, len).await?;
+        let skip_indicator = self
+            .send_file_action_data(job, len)
+            .await
+            .map_err(|_| SendFileError::Protocol)?;
         if skip_indicator == AckType::Skip {
             return Ok(0);
         }
@@ -553,10 +584,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             };
             let mut buf = vec![0; buf_size];
 
-            // Read a chunk from the file
-            f.read_exact(&mut buf).await.map_err(|_| {
-                error!("Could not read chunk from file");
-                ()
+            // Read a chunk from the file. The transfer was already announced
+            // to the server, so failing here leaves the connection desynced.
+            f.read_exact(&mut buf).await.map_err(|e| {
+                error!("Could not read chunk from file {}: {}", source_display, e);
+                SendFileError::Protocol
             })?;
             len_read += buf.len() as u64;
 
@@ -566,13 +598,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Actor<S> {
             // Write the compressed chunk to the server
             self.write(compressed).await.map_err(|_| {
                 error!("Failed to write compressed data");
-                ()
+                SendFileError::Protocol
             })?;
 
             // Await acknowledgment for the chunk
             self.acked().await.map_err(|_| {
                 error!("Failed to receive acknowledgment for chunk");
-                ()
+                SendFileError::Protocol
             })?;
         }
 
