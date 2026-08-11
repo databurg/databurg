@@ -158,6 +158,12 @@ Databurg is configured at runtime from a config file (`/etc/databurg.cnf` by
 default, or `-c <path>`). Nothing is compiled into the binaries, and a missing or
 unreadable config file is a fatal error. See [`databurg.cnf.sample`](./databurg.cnf.sample).
 
+> `-c` is accepted on either side of the subcommand — both
+> `databurg -c FILE backup …` and `databurg backup -c FILE …` work.
+> Release 0.0.1 accepted only the latter and then silently ignored the value,
+> always reading `/etc/databurg.cnf`; from 0.3.1 on the path is honoured
+> wherever it is given, so scripts written for 0.0.1 keep working unchanged.
+
 - `SERVER_HOSTNAME`: Server IP address or hostname.
 - `SERVER_PORT`: Server listening port (default: 2403).
 - `PRE_SHARED_SECURITY_TOKEN`: Security token for authentication.
@@ -168,7 +174,10 @@ unreadable config file is a fatal error. See [`databurg.cnf.sample`](./databurg.
   it with `openssl x509 -in cert.pem -outform DER | sha256sum`.
 - `SERVER_LISTEN`: IP address for server binding (default: 0.0.0.0).
 - `STORAGE_BASE_DIR`: Base directory for data storage.
-- `MAX_CONNECTIONS`: Server: cap on concurrent connections (default: 128).
+- `MAX_CONNECTIONS`: Server: cap on concurrent connections (default: 2048).
+  Size it above `nodes × 110` — one backup process opens eleven connections
+  and the runner starts ten in parallel — or legitimate backups stall behind
+  the cap until they time out.
 - `CERTIFICATE_FILE`: Path to a TLS certificate. **Required in production** —
   without it the server generates an ephemeral self-signed certificate whose pin
   changes on every restart, which breaks pinned clients.

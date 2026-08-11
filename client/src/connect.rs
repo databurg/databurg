@@ -50,8 +50,15 @@ pub async fn sync_threaded(
 
         // Spawn an asynchronous task for each connection
         let h = tokio::spawn(async move {
-            // Build Socket and spawn Actor with Socket as argument
-            let tls_stream = actor::connect().await.unwrap();
+            // Build Socket and spawn Actor with Socket as argument. A server
+            // that is down, or a certificate that fails the pin check, is an
+            // ordinary operational condition — the cause has already been
+            // logged, so end this connection quietly instead of panicking once
+            // per connection and burying the message in backtraces.
+            let tls_stream = match actor::connect().await {
+                Ok(stream) => stream,
+                Err(_) => return,
+            };
             let mut a = Actor::new(tokio_rustls::TlsStream::Client(tls_stream));
 
             // Perform handshake
