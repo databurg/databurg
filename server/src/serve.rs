@@ -5,9 +5,19 @@ use log::{error, info};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rustls::ServerConfig;
 use rustls_pemfile::{self, certs, private_key};
+use std::time::Duration;
 use std::{fs, io::Cursor, sync::Arc};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
+
+/// Default cap on concurrently handled connections (override with
+/// `MAX_CONNECTIONS`). Bounds file descriptors, tasks and memory against an
+/// unauthenticated connection flood.
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
+/// Time budget for the TLS handshake, so half-open handshakes cannot pin a
+/// connection slot indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Main server function to start serving
 pub async fn serve() {
@@ -19,25 +29,42 @@ pub async fn serve() {
         .await
         .expect("Cannot bind to address");
 
+    let max_connections = env::var("MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
+    let limiter = Arc::new(Semaphore::new(max_connections));
+
     log::info!("Databurg Server Listening on: {}", server_listen_addr);
     log::info!("Databurg Storage Basedir: {}", storage_base_dir);
+    log::info!("Max concurrent connections: {}", max_connections);
 
     loop {
         match listener.accept().await {
             Ok((socket, _addr)) => {
+                // Bound concurrency: wait for a free slot before accepting work.
+                let permit = match Arc::clone(&limiter).acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
                 let tls_acceptor = tls_acceptor.clone();
                 let storage_base_dir = storage_base_dir.clone();
 
                 tokio::spawn(async move {
-                    match tls_acceptor.accept(socket).await {
-                        Ok(tls_stream) => {
+                    // Hold the slot for the whole connection lifetime.
+                    let _permit = permit;
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls_acceptor.accept(socket)).await
+                    {
+                        Ok(Ok(tls_stream)) => {
                             log::debug!(
                                 "Client connected: {:?}",
                                 tls_stream.get_ref().0.peer_addr()
                             );
                             handle_client(tls_stream, &storage_base_dir).await;
                         }
-                        Err(e) => error!("TLS handshake failed: {:?}", e),
+                        Ok(Err(e)) => error!("TLS handshake failed: {:?}", e),
+                        Err(_) => error!("TLS handshake timed out"),
                     }
                 });
             }
@@ -154,6 +181,8 @@ async fn handle_client(
     let actor = Actor::new(tokio_rustls::TlsStream::Server(tls_stream));
     let mut handler = Handler::new(actor, storage_base_dir);
     handler.run(None).await;
+    // A connection that dropped mid-transfer leaves a temporary blob behind.
+    handler.abort_pending().await;
     log::debug!("Client disconnected");
 }
 

@@ -17,22 +17,50 @@ use std::fs;
 use std::io::prelude::*;
 use std::os::unix::fs::{chown, symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use walkdir::WalkDir;
 
-// Decompress the file data after receiving
-fn decompress_data(data: &[u8]) -> Vec<u8> {
+/// Process-wide counter for unique temporary blob file names.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Decompresses one received chunk, refusing to expand it beyond `max` bytes.
+/// A legitimate chunk decompresses to at most one plaintext chunk
+/// (`DEFAULT_CHUNK_SIZE`); the bound turns a decompression bomb into an error
+/// instead of unbounded memory, and a malformed stream into an error instead
+/// of a panic.
+fn decompress_data(data: &[u8], max: usize) -> std::io::Result<Vec<u8>> {
     let mut decoder = GzDecoder::new(data);
-    let mut decompressed_data = Vec::new();
-    decoder.read_to_end(&mut decompressed_data).unwrap();
-    decompressed_data
+    let mut out = Vec::new();
+    // Read one byte past the limit so an over-long stream is detectable.
+    decoder
+        .by_ref()
+        .take(max as u64 + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed chunk exceeds the per-chunk limit",
+        ));
+    }
+    Ok(out)
 }
 
 pub struct Handler<S> {
     pub actor: Actor<S>,
     storage_dir: String,
+    /// The blob currently being received, if any. It is written to a temporary
+    /// file and only made visible once fully received and fsynced.
+    pending_write: Option<PendingWrite>,
+}
+
+/// A blob being streamed to a temporary file, not yet committed.
+struct PendingWrite {
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    job: InnerJob,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +109,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         Handler {
             actor,
             storage_dir: storage_dir.to_string(),
+            pending_write: None,
         }
     }
 
@@ -128,13 +157,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         point_in_time: Option<SystemTime>,
     ) -> Option<PathBuf> {
         if let Some(pit) = point_in_time {
-            // Check at specific point in time
-            let history_items = self.get_deletion_history_items(path.clone()).await.unwrap();
+            // Check the closed deletion intervals recorded in the history.
+            let history_items = self
+                .get_deletion_history_items(path.clone())
+                .await
+                .unwrap_or_default();
             let pit = truncate_to_seconds(pit);
             for item in history_items.iter() {
                 if truncate_to_seconds(item.deleted_at).le(&pit)
                     && truncate_to_seconds(item.deleted_til).gt(&pit)
                 {
+                    return Some(path);
+                }
+            }
+            // A file that is still deleted now has an *open* interval
+            // [deleted_at, ∞) that the history does not record yet: treat it as
+            // deleted for any point in time at or after the deletion. Without
+            // this, a file deleted and never re-added would wrongly reappear in
+            // point-in-time recovery.
+            let mut marker = path.clone();
+            marker.push(".deleted");
+            if let Ok(deleted_at) = marker.metadata().and_then(|m| m.modified()) {
+                if truncate_to_seconds(deleted_at).le(&pit) {
                     return Some(path);
                 }
             }
@@ -209,9 +253,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         // Retrieve current deletion history items
         let mut history_items = self.get_deletion_history_items(path.clone()).await?;
 
-        // Create a new deletion history item
+        // Create a new deletion history item. `deleted_at` is when the deletion
+        // was recorded — the `.deleted` marker's own timestamp — not when the
+        // file first existed (the object directory's creation time), which
+        // would wrongly mark the file deleted for its entire history.
+        let mut marker = path.clone();
+        marker.push(".deleted");
+        let deleted_at = marker
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| SystemTime::now());
         let new_item = DeletionHistoryItem {
-            deleted_at: path.metadata()?.created()?,
+            deleted_at,
             deleted_til: SystemTime::now(),
         };
 
@@ -560,68 +613,105 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         latest
     }
 
-    /// Initializes a file for writing based on the provided `FileActionData`.
-    /// This function creates the necessary directories, creates the file, writes metadata,
-    /// and sets the "latest" symlink.
-    async fn init_file(
-        &mut self,
-        cad: Option<FileActionData>,
-    ) -> Result<Option<tokio::fs::File>, ()> {
-        let job_inner = cad.unwrap().job.clone();
-        let new_file_hash = job_inner.file_hash.clone().unwrap_or_default();
+    /// Opens a temporary file for an incoming blob and records it as the
+    /// pending write. The blob is deliberately NOT made visible here: `.meta`
+    /// and the `latest` symlink are only written in [`Self::commit_blob`], once
+    /// every declared byte has arrived and been fsynced. Until then an
+    /// interrupted transfer leaves only an ignored `.tmp-*` file, so preflight
+    /// asks for the file again instead of treating a torn blob as complete.
+    ///
+    /// The hash is validated and the directory is built via `object_dir`, so a
+    /// malicious bucket / path / hash cannot escape the storage root.
+    async fn begin_blob(&mut self, cad: &FileActionData) -> Result<File, ()> {
+        let job = cad.job.clone();
+        let hash = job.file_hash.clone().unwrap_or_default();
         // The hash becomes the blob file name; reject anything that is not a
         // plain 64-hex digest so it cannot carry `/` or `..`.
-        if !crate::is_valid_hash(&new_file_hash) {
+        if !crate::is_valid_hash(&hash) {
             error!("Rejecting job with invalid file hash");
             return Err(());
         }
-        // Construct the full path to the file. object_dir() sanitizes the
-        // bucket and prefers the byte-exact raw path, stripping absolute or
-        // parent components, so a client cannot write outside the storage root.
-        let mut path = self.object_dir(
-            job_inner.bucket.as_deref().unwrap_or_default(),
-            &job_inner.wire_path(),
-        );
 
-        // Create necessary directories
-        if let Err(e) = fs::create_dir_all(&path) {
-            info!("Could not create directory {}: {:?}", path.display(), e);
+        // Object directory: <storage>/<sanitized bucket>/<sanitized path>/.
+        // object_dir() sanitizes the bucket and prefers the byte-exact raw
+        // path, so a client cannot write outside the storage root.
+        let dir = self.object_dir(job.bucket.as_deref().unwrap_or_default(), &job.wire_path());
+        if let Err(e) = fs::create_dir_all(&dir) {
+            error!("Could not create directory {}: {:?}", dir.display(), e);
             return Err(());
         }
 
-        // Append the file hash to the path
-        path.push(&new_file_hash);
+        let final_path = dir.join(&hash);
+        let tmp_path = dir.join(format!(
+            ".tmp-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
 
-        // Create the file
-        let real_file_path = path.clone();
-        let fd = match File::create(&real_file_path).await {
-            Ok(f) => Some(f),
-            Err(e) => {
-                error!("Could not open file for write {}: {:?}", path.display(), e);
-                return Err(());
-            }
+        let fd = File::create(&tmp_path).await.map_err(|e| {
+            error!("Could not create temp file {}: {:?}", tmp_path.display(), e);
+        })?;
+
+        self.pending_write = Some(PendingWrite {
+            tmp_path,
+            final_path,
+            job,
+        });
+        Ok(fd)
+    }
+
+    /// Finalizes a fully-received blob: fsync the data, atomically rename the
+    /// temporary file to its content-hash name, then publish `.meta` and the
+    /// `latest` symlink. Only after this is the blob visible to preflight and
+    /// recover. Any failure removes the temporary file and leaves the previous
+    /// version untouched.
+    async fn commit_blob(&mut self, mut fd: File) -> Result<(), ()> {
+        let pending = match self.pending_write.take() {
+            Some(p) => p,
+            None => return Err(()),
         };
 
-        // Canonicalize the file path
-        let real_file_path = match real_file_path.canonicalize() {
-            Ok(p) => p,
-            Err(e) => {
-                error!(
-                    "Could not canonicalize file path {}: {:?}",
-                    path.display(),
-                    e
-                );
-                return Err(());
-            }
-        };
+        // Durability: the bytes must be on disk before we report success.
+        if let Err(e) = fd.sync_all().await {
+            error!("Could not fsync {}: {:?}", pending.tmp_path.display(), e);
+            let _ = tokio::fs::remove_file(&pending.tmp_path).await;
+            return Err(());
+        }
+        drop(fd);
 
-        // Write metadata and set the "latest" symlink
-        self.to_metadata(&real_file_path, job_inner).await;
-        self.set_latest(path).unwrap_or_else(|e| {
+        // Atomic publish within the same directory.
+        if let Err(e) = tokio::fs::rename(&pending.tmp_path, &pending.final_path).await {
+            error!(
+                "Could not commit blob {}: {:?}",
+                pending.final_path.display(),
+                e
+            );
+            let _ = tokio::fs::remove_file(&pending.tmp_path).await;
+            return Err(());
+        }
+
+        let object_dir = pending.final_path.parent().map(|p| p.to_path_buf());
+        self.to_metadata(&pending.final_path, pending.job).await;
+        self.set_latest(pending.final_path).unwrap_or_else(|e| {
             error!("Failed to set latest symlink: {:?}", e);
         });
+        // Storing a new version means the file exists again: close any open
+        // deletion interval (recording it in the history) and clear the delete
+        // marker. Without this, a file re-added with *changed* content — which
+        // takes this path rather than the skip branch — would stay marked
+        // deleted and be wrongly omitted from recovery.
+        if let Some(dir) = object_dir {
+            let _ = self.unset_delete_marker(dir).await;
+        }
+        Ok(())
+    }
 
-        Ok(fd)
+    /// Removes a half-written temporary blob, if any, and forgets it. Called
+    /// when a transfer is abandoned or a connection ends mid-stream.
+    pub async fn abort_pending(&mut self) {
+        if let Some(pending) = self.pending_write.take() {
+            let _ = tokio::fs::remove_file(&pending.tmp_path).await;
+        }
     }
 
     /// Creates an empty recovered file (the zero-length case of recover) at the
@@ -963,11 +1053,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         }
     }
 
-    async fn reset_fd(&self, fd: &mut Option<File>) {
-        if fd.is_some() {
-            _ = fd.as_mut().unwrap().shutdown().await;
-            *fd = None;
+    async fn reset_fd(&mut self, fd: &mut Option<File>) {
+        if let Some(mut f) = fd.take() {
+            _ = f.shutdown().await;
         }
+        // A new command or file starts here; discard any half-written blob.
+        self.abort_pending().await;
     }
 
     async fn handle_command(
@@ -1103,6 +1194,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 let buf_str = String::from_utf8_lossy(&buf);
                 match serde_json::from_str::<SyncMetadata>(&buf_str) {
                     Ok(meta) => {
+                        // Authorize against the target bucket before writing
+                        // anything: this stage sets delete markers and appends
+                        // the bucket's metadata history, so without this check
+                        // any peer could destroy another tenant's backup.
+                        if self
+                            .handle_bucket_auth(meta.bucket.clone(), true)
+                            .await
+                            .is_err()
+                        {
+                            self.actor.send_nack().await;
+                            return Ok(());
+                        }
                         // Get all files associated available on the client
                         // side and figure out which files where deleted in
                         // the meantime. Compared on raw path bytes: names
@@ -1201,14 +1304,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
 
                 *await_bytes = cad.file_size.unwrap() as usize;
                 if *await_bytes == 0 {
-                    // clear the file
-                    if let Ok(ld) = self.init_file(current_action_data.clone()).await {
-                        *fd = ld;
-                        _ = fd.as_mut().unwrap().sync_all();
-                        *fd = None;
-                        self.actor.send_skip().await;
-                    } else {
-                        self.actor.send_nack().await;
+                    // Zero-length file: create and immediately commit it.
+                    match self.begin_blob(&cad).await {
+                        Ok(f) => {
+                            if self.commit_blob(f).await.is_ok() {
+                                self.actor.send_skip().await;
+                            } else {
+                                self.actor.send_nack().await;
+                            }
+                        }
+                        Err(_) => {
+                            self.abort_pending().await;
+                            self.actor.send_nack().await;
+                        }
                     }
                     return Ok(Stage::Command);
                 }
@@ -1231,34 +1339,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
     ) -> Result<Option<Stage>, ()> {
         match self.actor.next_msg().await {
             Some(buf) => {
-                let buf = decompress_data(&buf);
-                if fd.is_none() {
-                    *fd_pos = 0;
-                    if let Ok(ld) = self.init_file(current_action_data.clone()).await {
-                        *fd = ld;
-                    } else {
+                let buf = match decompress_data(&buf, crate::actor::DEFAULT_CHUNK_SIZE) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Could not decompress chunk: {:?}", e);
+                        self.abort_pending().await;
+                        *fd = None;
                         self.actor.send_nack().await;
                         return Ok(Some(Stage::Command));
                     }
+                };
+
+                if fd.is_none() {
+                    *fd_pos = 0;
+                    match self.begin_blob(&current_action_data.clone().unwrap()).await {
+                        Ok(f) => *fd = Some(f),
+                        Err(_) => {
+                            self.actor.send_nack().await;
+                            return Ok(Some(Stage::Command));
+                        }
+                    }
                 }
 
-                let res = fd.as_mut().unwrap().write_all(&buf).await;
-
-                if res.is_ok() {
-                    _ = fd.as_mut().unwrap().flush().await;
-                    *fd_pos += buf.len();
-                } else {
-                    error!("Could not write to file: {:?}", res.err().unwrap());
+                // Never accept more than the client declared.
+                if *fd_pos + buf.len() > await_bytes {
+                    error!(
+                        "Client sent more data than declared ({} > {})",
+                        *fd_pos + buf.len(),
+                        await_bytes
+                    );
+                    self.abort_pending().await;
                     *fd = None;
                     self.actor.send_nack().await;
                     return Ok(Some(Stage::Command));
                 }
 
-                if *fd_pos == await_bytes {
-                    _ = fd.as_mut().unwrap().sync_all();
+                if let Err(e) = fd.as_mut().unwrap().write_all(&buf).await {
+                    error!("Could not write to file: {:?}", e);
+                    self.abort_pending().await;
                     *fd = None;
-                    // Reset state
-                    self.actor.send_ack().await;
+                    self.actor.send_nack().await;
+                    return Ok(Some(Stage::Command));
+                }
+                *fd_pos += buf.len();
+
+                if *fd_pos == await_bytes {
+                    // Full blob received: fsync, atomically publish, ACK only
+                    // then. A short transfer never reaches this point, so it is
+                    // never committed.
+                    let f = fd.take().unwrap();
+                    if self.commit_blob(f).await.is_ok() {
+                        self.actor.send_ack().await;
+                    } else {
+                        self.actor.send_nack().await;
+                    }
                     return Ok(Some(Stage::Command));
                 }
 
@@ -1466,7 +1600,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 if *await_bytes == 0 {
                     if let Ok(ld) = self.client_init_file(Some(cad.clone())).await {
                         *fd = ld;
-                        _ = fd.as_mut().unwrap().sync_all();
+                        if let Some(f) = fd.as_mut() {
+                            let _ = f.sync_all().await;
+                        }
                         *fd = None;
                         self.actor.send_skip().await;
                     } else {
@@ -1495,7 +1631,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
         // Receiving binary chunks from the Server
         match self.actor.next_msg().await {
             Some(buf) => {
-                let buf = decompress_data(&buf);
+                let buf = match decompress_data(&buf, crate::actor::DEFAULT_CHUNK_SIZE) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Could not decompress chunk: {:?}", e);
+                        *fd = None;
+                        self.actor.send_nack().await;
+                        return Ok(Some(Stage::Command));
+                    }
+                };
                 if fd.is_none() {
                     *fd_pos = 0;
                     // Byte-exact, sanitized destination: recover_dest() strips
@@ -1521,7 +1665,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                                 path.display().to_string(),
                                 e
                             );
-                            None
+                            self.actor.send_nack().await;
+                            return Ok(Some(Stage::Command));
                         }
                     };
                 }
@@ -1538,7 +1683,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Handler<S> {
                 }
 
                 if *fd_pos == await_bytes as usize {
-                    _ = fd.as_mut().unwrap().sync_all();
+                    if let Some(f) = fd.as_mut() {
+                        let _ = f.sync_all().await;
+                    }
                     *fd = None;
 
                     // Reset state
